@@ -1,0 +1,972 @@
+---
+title: 'STAT 443 Consulting Project'
+author: "Siddharth Ahuja (), Zhe Huang (zhuang60), Krti Tallam (), Jiewen Wu ()"
+date: "September 21, 2018"
+abstract: ""
+output: 
+  html_document: 
+    theme: flatly
+    toc: true
+---
+
+```{r set-options, include = FALSE}
+knitr::opts_chunk$set(fig.align = "center", echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r load-packages, FALSE}
+#install.packages('forecast')
+#install.packages('faraway')
+#install.packages('gridExtra')
+library(knitr)
+library(kableExtra)
+library(MASS)
+library(faraway)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(caret)
+library(ElemStatLearn)
+library(forecast)
+library(lubridate)
+```
+
+***
+
+# Introduction
+
+
+## Combine the data
+
+```{r}
+# Import data
+households = read.csv("5000_households.csv")
+products = read.csv("5000_products.csv")
+transactions = read.csv("5000_transactions.csv")
+
+# Creating quarters with respect to purchase dates
+transactions$QUARTER = quarters(as.Date(transactions$PURCHASE_, format = "%d-%b-%y"))
+
+# Merging datasets
+data_merge1 = merge(transactions, products, by = "PRODUCT_NUM", all = FALSE)
+data_merge2 = merge(transactions, households, by = "HSHD_NUM", all = FALSE)
+
+
+
+```
+
+```{r}
+# Creating a new dataset 'spending'
+spending = data.frame(
+  "HSHD_NUM" = households$HSHD_NUM,
+  "Spending_2016" = rep(0, 5000),
+  "Spending_2017" = rep(0, 5000),
+  "Change" = rep(0, 5000),
+  "Trend" = rep(character(1), 5000)
+  )
+
+transactions_2016 = filter(data_merge2, YEAR == 2016)
+transactions_2017 = filter(data_merge2, YEAR == 2017)
+
+for (i in 1:5000) {
+  spending$Spending_2016[i] = sum(transactions_2016$SPEND[transactions_2016$HSHD_NUM == spending$HSHD_NUM[i]])
+  spending$Spending_2017[i] = sum(transactions_2017$SPEND[transactions_2017$HSHD_NUM == spending$HSHD_NUM[i]])
+  spending$Change[i] = spending$Spending_2017[i] - spending$Spending_2016[i]
+  if (spending$Change[i] < 0) {
+    spending$Trend = "decrease"
+  } else {
+    spending$Trend = "increase"
+  }
+}
+
+```
+
+
+
+
+```{r}
+# Importing a dataset with all N/A values removed.
+households_fixed = read.csv("5000_households_fixed.csv")
+
+# Combining region with household information
+households_region = summarise(group_by(transactions, HSHD_NUM), Uniqueness = isTRUE(length(unique(STORE_R)) == 1))
+households_2 = merge(households_fixed, households_region, by = "HSHD_NUM", all = FALSE)
+households_2$Region = rep(character(1), 5000)
+Region = c("CENTRAL", "EAST", "SOUTH", "WEST")
+
+for (i in 1:5000) {
+  if (households_2$Uniqueness[i] == TRUE) {
+    households_2$Region[i] = Region[unique(transactions$STORE_R[transactions$HSHD_NUM == households_2$HSHD_NUM[i]])]
+  }
+}
+
+data_merge3 = merge(transactions, households_2, by = "HSHD_NUM", all = FALSE)
+
+```
+
+
+```{r warning = FALSE}
+# Creating a dataset defined by basket number
+Basket = summarise(group_by(data_merge3,BASKET_NUM,PURCHASE_,WEEK_NUM,YEAR,QUARTER,L,AGE_RANGE,MARITAL,INCOME_RANGE,HOMEOWNER,HSHD_COMPOSITION,HH_SIZE,CHILDREN,Uniqueness,Region),totalSPEND = sum(SPEND), totalUnit = sum(UNITS))
+
+# Creating a dataset that aims to evaluate total spending of each household
+totalSpend = summarise(group_by(data_merge3,HSHD_NUM,L,AGE_RANGE,MARITAL,INCOME_RANGE,HOMEOWNER,HSHD_COMPOSITION,HH_SIZE,CHILDREN,Uniqueness,Region),totalSPEND = sum(SPEND), totalUnit = sum(UNITS))
+
+# Removing HSHD_NUM and Uniqueness & Creating a Linear Model using totalSPEND as a function of all other variables
+totalSpend$HSHD_NUM = NULL
+totalSpend$Uniqueness = NULL
+spend_mod = lm(totalSPEND ~., data = totalSpend)
+
+```
+
+```{r}
+# Figuring and removing potential outliers 
+plot(spend_mod)
+mod_cd = cooks.distance(spend_mod)
+totalSpend_fix = totalSpend[mod_cd < 4 / length(mod_cd), ]
+mod_fix = lm(totalSPEND ~ . , data = totalSpend_fix)
+summary(mod_fix)
+
+
+# Running stepwise selection to find out the major attribute to the dependent variable
+step(mod_fix)
+
+# Refitting the model
+select_spend_mod = lm(
+  formula = totalSPEND ~ AGE_RANGE + INCOME_RANGE + HOMEOWNER +
+  HSHD_COMPOSITION + Region + totalUnit,
+  data = totalSpend_fix
+  )
+  
+# R2 for the original model vs. new model
+data.frame(
+  orig_r2 = summary(spend_mod)$adj.r.squared,
+  model__r2 = summary(select_spend_mod)$adj.r.squared
+  )
+
+# Sorting the data
+d2 = arrange(totalSpend_fix, totalSPEND)
+
+# Performing Elastic Net
+set.seed(8451)
+mod_elastic = train(
+  totalSPEND ~ . ,
+  data = d2,
+  trControl = trainControl(method = "cv", number = 5),
+  method = "glmnet",
+  tuneLength = 10
+  )
+```
+
+
+```{r}
+# Performing Random Forest
+set.seed(8451)
+spend_mod_rf = train(
+  totalSPEND ~ .,
+  data = d2,
+  trControl = trainControl(method = "cv", number = 5),
+  method = "rf",
+  tuneGrid = expand.grid(mtry = seq(1, ncol(totalSpend_fix) - 1))
+  )
+```
+
+
+```{r}
+# Performing Gradient Boosting Machine
+gbm_grid = expand.grid(interaction.depth = c(1, 2, 3),
+                       n.trees = (1:30) * 100,
+                       shrinkage = c(0.1, 0.3),
+                       n.minobsinnode = c(10, 20))
+
+set.seed(8451)
+spend_mod_gbm = train(
+  totalSPEND ~ .,
+  data = d2,
+  trControl = trainControl(method = "cv", number = 5),
+  method = "gbm",
+  tuneGrid = gbm_grid,
+  verbose = FALSE
+  )
+```
+
+```{r}
+
+get_rmse = function(actual, predicted) {
+  sqrt(mean((actual - predicted) ^ 2))
+}
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best,]
+  rownames(best_result) = NULL
+  best_result
+}
+
+(rmse_result = data.frame(
+  Model = c("Elastic Net", "Gradient Boosting Machine", "Random Forest"),
+  TestError = c(
+  get_best_result(mod_elastic)$RMSE,
+  get_best_result(spend_mod_gbm)$RMSE,
+  get_best_result(spend_mod_rf)$RMSE
+  )
+  ))
+  
+# Check performance of the Elastic Net model
+ts = sort(totalSpend_fix$totalSPEND)
+par(mfrow = c(2,2))
+plot(ts)
+plot(fitted(mod_elastic),col = "orange")
+
+```
+
+```{r}
+# Result table for the Elastic Net 
+kable(get_best_result(mod_elastic), "html", digits = 2) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r}
+# Plots that shows the distribution of total spend of each household
+plot(fitted(mod_fix), resid(mod_fix),col = 'dodgerblue',pch = 20,cex = 1.5, xlab = 'fitted', ylab = 'residuals')
+abline(h = 0, lty = 2, col = 'darkorange', lwd = 2)
+plot(ts)
+
+```
+
+```{r}
+# Separating data by regions and calculating the weekly total spend of each region 
+week_spend = summarise(group_by(transactions,WEEK_NUM,STORE_R),totalSPEND = sum(SPEND), totalUnit = sum(UNITS))
+total_week_spend = summarise(group_by(week_spend,WEEK_NUM), totalSPEND = sum(totalSPEND), totalUnit = sum(totalUnit))
+
+week_central = week_spend[week_spend$STORE_R == "CENTRAL",]
+week_east = week_spend[week_spend$STORE_R == "EAST   ",]
+week_west = week_spend[week_spend$STORE_R == "WEST   ",]
+week_south = week_spend[week_spend$STORE_R == "SOUTH  ",]
+
+# Calculating two standard deviations away from the mean of total spend for regions in the U.S.
+mean(week_central$totalSPEND) - 2 * sd(week_central$totalSPEND)
+mean(week_central$totalSPEND) + 2 * sd(week_central$totalSPEND)
+mean(week_east$totalSPEND) - 2 * sd(week_east$totalSPEND)
+mean(week_east$totalSPEND) + 2 * sd(week_east$totalSPEND)
+mean(week_west$totalSPEND) - 2 * sd(week_west$totalSPEND)
+mean(week_west$totalSPEND) + 2 * sd(week_west$totalSPEND)
+mean(week_south$totalSPEND) - 2 * sd(week_south$totalSPEND)
+mean(week_south$totalSPEND) + 2 * sd(week_south$totalSPEND)
+
+# Calculating two standard deviations away from the mean of total spend for U.S.level
+mean(total_week_spend$totalSPEND) - 2 * sd(total_week_spend$totalSPEND)
+mean(total_week_spend$totalSPEND) + 2 * sd(total_week_spend$totalSPEND)       
+```
+
+
+```{r}
+# Sorting data and grouping observations by regions & Calculating daily total spend
+daily_central = transactions[transactions$STORE_R == "CENTRAL",]
+d_central = summarise(group_by(daily_central,PURCHASE_,STORE_R),totalSPEND = sum(SPEND))
+
+daily_east = transactions[transactions$STORE_R == "EAST   ",]
+d_east = summarise(group_by(daily_east,PURCHASE_,STORE_R),totalSPEND = sum(SPEND))
+
+daily_west = transactions[transactions$STORE_R == "WEST   ",]
+d_west = summarise(group_by(daily_west,PURCHASE_,STORE_R),totalSPEND = sum(SPEND))
+
+daily_south = transactions[transactions$STORE_R == "SOUTH  ",]
+d_south = summarise(group_by(daily_south,PURCHASE_,STORE_R),totalSPEND = sum(SPEND))
+
+d_central_sort = d_central[order(as.Date(d_central$PURCHASE_, format = "%d-%b-%y")),]
+d_east_sort = d_east[order(as.Date(d_east$PURCHASE_, format = "%d-%b-%y")),]
+d_west_sort = d_west[order(as.Date(d_west$PURCHASE_, format = "%d-%b-%y")),]
+d_south_sort = d_south[order(as.Date(d_south$PURCHASE_, format = "%d-%b-%y")),]
+
+
+```
+
+
+```{r}
+# Creating dataset for holiday seasons & checking percentage increase for each commodity with respect to its mean
+commodity_week = summarise(group_by(data_merge1,COMMODITY,WEEK_NUM), totalspend = sum(SPEND))
+pinduoduo = summarise(group_by(data_merge1,COMMODITY), totalsale = sum(SPEND))
+
+week_12 = filter(commodity_week, WEEK_NUM == "12")
+week_67 = filter(commodity_week, WEEK_NUM == "67")
+week_easter = merge(week_12, week_67, by = "COMMODITY")
+week_easter$avg_spend = (week_easter$totalspend.x + week_easter$totalspend.y) / 2
+week_easter_final = merge(week_easter, pinduoduo, by = "COMMODITY")
+week_easter_final$avg = week_easter_final$totalsale / 104
+week_easter_final$pctdiff = (week_easter_final$avg_spend - week_easter_final$avg) / week_easter_final$avg * 100
+
+week_47 = filter(commodity_week, WEEK_NUM == "47")
+week_99 = filter(commodity_week, WEEK_NUM == "99")
+week_tg = merge(week_47, week_99, by = "COMMODITY")
+week_tg$avg_spend = (week_tg$totalspend.x + week_tg$totalspend.y) / 2
+week_tg_final = merge(week_tg, pinduoduo, by = "COMMODITY")
+week_tg_final$avg = week_tg_final$totalsale / 104
+week_tg_final$pctdiff = (week_tg_final$avg_spend - week_tg_final$avg) / week_tg_final$avg * 100
+
+week_51 = filter(commodity_week, WEEK_NUM == "51")
+week_103 = filter(commodity_week, WEEK_NUM == "103")
+week_xmas = merge(week_51, week_103, by = "COMMODITY")
+week_xmas$avg_spend = (week_xmas$totalspend.x + week_xmas$totalspend.y) / 2
+week_xmas_final = merge(week_xmas, pinduoduo, by = "COMMODITY")
+week_xmas_final$avg = week_xmas_final$totalsale / 104
+week_xmas_final$pctdiff = (week_xmas_final$avg_spend - week_xmas_final$avg) / week_xmas_final$avg * 100
+```
+
+```{r}
+# Creating new datasets based on commondities
+us_product = summarise(
+  group_by(data_merge1, COMMODITY),
+  totalSPEND = sum(SPEND),
+  totalUnit = sum(UNITS)
+  )
+us_product = mutate(
+  us_product,
+  sale_percentage = totalSPEND / sum(totalSPEND) * 100,
+  unit_percentage = totalUnit / sum(totalUnit) * 100
+  )
+west_product = summarise(
+  group_by(data_merge1[data_merge1$STORE_R == "WEST   ", ], STORE_R, COMMODITY),
+  totalSPEND = sum(SPEND),
+  totalUnit = sum(UNITS)
+  )
+west_product = mutate(
+  west_product,
+  sale_percentage = totalSPEND / sum(totalSPEND) * 100,
+  unit_percentage = totalUnit / sum(totalUnit) * 100
+  )
+east_product = summarise(
+  group_by(data_merge1[data_merge1$STORE_R == "EAST   ", ], STORE_R, COMMODITY),
+  totalSPEND = sum(SPEND),
+  totalUnit = sum(UNITS)
+  )
+east_product = mutate(
+  east_product,
+  sale_percentage = totalSPEND / sum(totalSPEND) * 100,
+  unit_percentage = totalUnit / sum(totalUnit) * 100
+  )
+south_product = summarise(
+  group_by(data_merge1[data_merge1$STORE_R == "SOUTH  ", ], STORE_R, COMMODITY),
+  totalSPEND = sum(SPEND),
+  totalUnit = sum(UNITS)
+  )
+south_product = mutate(
+  south_product,
+  sale_percentage = totalSPEND / sum(totalSPEND) * 100,
+  unit_percentage = totalUnit / sum(totalUnit) * 100
+  )
+central_product = summarise(
+  group_by(data_merge1[data_merge1$STORE_R == "CENTRAL", ], STORE_R, COMMODITY),
+  totalSPEND = sum(SPEND),
+  totalUnit = sum(UNITS)
+  )
+central_product = mutate(
+  central_product,
+  sale_percentage = totalSPEND / sum(totalSPEND) * 100,
+  unit_percentage = totalUnit / sum(totalUnit) * 100
+  )
+```
+
+
+```{r}
+# Exporting datasets
+write.csv(us_product, "us_product.csv")
+write.csv(west_product, "west_product.csv")
+write.csv(east_product, "east_product.csv")
+write.csv(south_product, "south_product.csv")
+write.csv(central_product, "central_product.csv")
+```
+
+```{r}
+# Fitting a Linear Model with time series components
+ts_spend = summarise(
+  group_by(transactions, PURCHASE_),
+  totalSPEND = sum(SPEND),
+  totalUnit = sum(UNITS)
+  )
+ts_spend$PURCHASE_ = as.Date(ts_spend$PURCHASE_, format = '%d-%b-%y')
+ts_spend = ts_spend[order(ts_spend$PURCHASE_),]
+ts_spend$totalSPEND = as.numeric(ts_spend$totalSPEND)
+str(ts_spend)
+```
+
+```{r}
+# Test for Stationary
+wt_fractdif = function(d, nwei,tau)
+{
+  wvec <- w0 <- 1
+  if(is.null(tau))
+  {
+    for(k in 1:(nwei-1))
+    {
+      w1 = (-1)*w0*(d-k+1)/k
+      wvec = c(wvec,w1)
+      w0 = w1
+    }
+  }else 
+ {
+    k = 1
+    while(abs(w0) >= tau)
+    {
+      w1 = (-1)*w0*(d-k+1)/k
+      wvec = c(wvec,w1)
+      w0 = w1
+      k = k+1
+    }
+    wvec = wvec[-length(wvec)]
+ }
+  return(wvec)
+}
+
+fracDiff = function(x, d, nwei, tau)
+{
+  weig = wt_fractdif(d = d, nwei = nwei, tau = tau)
+  nwei = length(weig)
+  nx = length(x)
+  rst = sapply(nwei:nx,function(i){
+    sum(weig*x[i:(i-nwei+1)])
+  })
+  return(rst)
+}
+
+
+fracD_c = fracDiff(ts_spend$totalSPEND, d = 0.5, tau = 0.001)
+diff_c = diff(ts_spend)
+
+trainDat <- ts_spend[1:floor(nrow(ts_spend)/3*2),]
+testDat <- ts_spend[(floor(nrow(ts_spend)/3*2)+1):nrow(ts_spend),]
+
+d_chosen <- 0 
+C_fracD <- fracDiff(trainDat$totalSPEND, d=d_chosen, tau=1e-4)
+tseries::kpss.test(C_fracD, null="Trend")
+tseries::adf.test(C_fracD)
+tseries::pp.test(C_fracD)
+stats::PP.test(C_fracD)
+summary(urca::ur.ers(C_fracD, model = "trend"))
+```
+
+```{r}
+ts_spend = mutate(ts_spend, MonthYear = paste(year(PURCHASE_), formatC(
+  month(PURCHASE_), width = 2, flag = "0"
+  )))
+
+ts_monthly = aggregate(
+  ts_spend$totalSPEND,
+  by = list(ts_spend$MonthYear),
+  FUN = function(x)
+  mean(x, na.rm = T)
+  )
+
+
+myts = ts(
+ts_month$x,
+frequency = 12,
+start = c(2016, 01),
+end = c(2017, 12)
+)
+plot(myts)
+
+myds_monthly = decompose(myts)
+plot(myds_monthly)
+
+my_df_ts <- data.frame(totalspend = myts, as.numeric(time(myts)))
+names(my_df_ts) = c("totalspend", "time")
+mymodel = tslm(totalspend ~ season+ trend, my_df_ts)
+my_fc = forecast(mymodel,h = 49,scientific = FALSE)
+
+
+autoplot(my_fc, main = "US",ylab = "Total Spend")
+
+
+```
+
+```{r}
+# Fitting a Linear Model with time series components (by week)
+ts_spend = mutate(ts_spend, Week = paste(year(PURCHASE_),formatC(week(PURCHASE_), width = 2, flag = "0")))
+
+ts_week = aggregate(
+  ts_spend$totalSPEND,
+  by = list(ts_spend$Week),
+  FUN = function(x)
+  mean(x, na.rm = T)
+  )
+
+myts_week = ts(
+  ts_week$x,
+  frequency = 52,
+  start = c(2016, 1),
+  end = c(2017, 52)
+  )
+
+plot(myts_week)
+myds_week = decompose(myts_week)
+plot(myds_week)
+my_df_ts_week = data.frame(totalspend = myts_week, as.numeric(time(myts_week)))
+names(my_df_ts_week) = c("totalspend", "time")
+mymodel_week = tslm(totalspend~season+trend,my_df_ts_week)
+my_fc_week = forecast(mymodel_week,h=220)
+autoplot(my_fc_week,main = "US",ylab = "Total Spend")
+
+```
+
+
+```{r}
+# Time series(central region_presentation) 
+
+d_central_sort_ts = d_central[order(as.Date(d_central$PURCHASE_, format = '%d-%b-%y')), ]
+d_central_sort_ts$totalSPEND = as.numeric(d_central_sort_ts$totalSPEND)
+
+
+central_ts = aggregate(
+  d_central_sort_ts$totalSPEND,
+  by = list(d_central_sort_ts$PURCHASE_),
+  FUN = function(x)
+  mean(x, na.rm = T)
+  )
+
+central_myts = ts(
+  central_ts$x,
+  frequency = 12,
+  start = c(2016, 01),
+  end = c(2017, 12)
+  )
+
+plot(central_myts)
+myds_monthly_central = decompose(central_myts)
+plot(myds_monthly_central)
+
+
+my_df_ts_central = data.frame(totalspend = central_myts, as.numeric(time(central_myts)))
+names(my_df_ts_central) = c("totalspend", "time")
+mymodel_central = tslm(totalspend ~ season+ trend, my_df_ts_central)
+my_fc_central = forecast(mymodel_central,h = 49)
+autoplot(my_fc_central, main = "Central Region",ylab = "Total Spend")
+
+```
+
+```{r}
+# Updated version: forecasting monthly total spend in central region
+d_central_a = d_central_sort
+d_central_a$PURCHASE_ = as.Date(d_central$PURCHASE_,format = '%d-%b-%y')
+d_central_a = d_central_a[order(d_central_a$PURCHASE_),]
+d_central_a$totalSPEND = as.numeric(d_central_a$totalSPEND)
+str(d_central_a)
+
+d_central_a = mutate(d_central_a, YearMonth = paste(year(PURCHASE_), formatC(
+  month(PURCHASE_), width = 2, flag = "0"
+  )))
+
+central_tsa = aggregate(
+  d_central_a$totalSPEND,
+  by = list(d_central_a$YearMonth),
+  FUN = function(x)
+  mean(x, na.rm = T)
+  )
+
+
+central_mytsa = ts(
+  central_tsa$x,
+  frequency = 12,
+  start = c(2016, 01, 03),
+  end = c(2017, 12, 31)
+  )
+plot(central_mytsa)
+myds_monthly_centrala = decompose(central_mytsa)
+plot(myds_monthly_centrala)
+
+
+my_df_ts_centrala = data.frame(totalspend = central_mytsa, as.numeric(time(central_mytsa)))
+names(my_df_ts_centrala) = c("totalspend", "time")
+mymodel_centrala = tslm(totalspend ~ season+ trend, my_df_ts_centrala)
+my_fc_centrala = forecast(mymodel_centrala,h = 49)
+autoplot(my_fc_centrala, main = "Central Region",ylab = "Total Spend")
+```
+
+```{r}
+# Time series(west region_presentation) 
+
+d_west_sort_ts = d_west[order(as.Date(d_west$PURCHASE_,format = '%d-%b-%y')),]
+d_west_sort_ts$totalSPEND = as.numeric(d_west_sort_ts$totalSPEND)
+
+west_ts_monthly = aggregate(
+  d_west_sort_ts$totalSPEND,
+  by = list(d_west_sort_ts$PURCHASE_),
+  FUN = function(x)
+  mean(x, na.rm = T)
+  )
+
+
+west_myts = ts(
+  west_ts_monthly$x,
+  frequency = 12,
+  start = c(2016, 01),
+  end = c(2017, 12)
+  )
+plot(west_myts)
+
+myds_monthly_west = decompose(west_myts)
+plot(myds_monthly_west)
+
+
+my_df_ts_west = data.frame(totalspend = west_myts, as.numeric(time(west_myts)))
+names(my_df_ts_west) = c("totalspend", "time")
+mymodel_west = tslm(totalspend ~ season+ trend, my_df_ts_west)
+my_fc_west = forecast(mymodel_west,h = 49)
+autoplot(my_fc_west, main = "West Region",ylab = "Total Spend")
+```
+```{r}
+# Updated version: forecasting monthly total spend in west region
+d_west_a = d_west_sort
+d_west_a$PURCHASE_ = as.Date(d_west$PURCHASE_,format = '%d-%b-%y')
+d_west_a = d_west_a[order(d_west_a$PURCHASE_),]
+d_west_a$totalSPEND = as.numeric(d_west_a$totalSPEND)
+str(d_west_a)
+
+d_west_a = mutate(d_west_a, YearMonth = paste(year(PURCHASE_),formatC(month(PURCHASE_), width = 2, flag = "0")))
+
+west_tsa_monthly = aggregate(
+  d_west_a$totalSPEND,
+  by = list(d_west_a$YearMonth),
+  FUN = function(x)
+  mean(x, na.rm = T)
+  )
+
+west_mytsa = ts(
+  west_tsa_monthly$x,
+  frequency = 12,
+  start = c(2016, 01),
+  end = c(2017, 12)
+  )
+plot(west_mytsa)
+
+mydsa_monthly_west = decompose(west_myts)
+plot(mydsa_monthly_west)
+
+
+my_df_tsa_west = data.frame(totalspend = west_mytsa, as.numeric(time(west_mytsa)))
+names(my_df_tsa_west) = c("totalspend", "time")
+mymodela_west = tslm(totalspend ~ season+ trend, my_df_tsa_west)
+my_fca_west = forecast(mymodela_west,h = 49)
+autoplot(my_fca_west, main = "West Region",ylab = "Total Spend")
+```
+
+```{r}
+# Time series(east region) 
+d_east_sort_ts = d_east[order(as.Date(d_east$PURCHASE_, format = "%d-%b-%y")),]
+d_east_sort_ts$totalSPEND = as.numeric(d_east_sort_ts$totalSPEND)
+
+east_ts_monthly = aggregate(
+  d_east_sort_ts$totalSPEND,
+  by = list(d_east_sort_ts$PURCHASE_),
+  FUN = function(x)
+  mean(x, na.rm = T)
+  )
+
+east_myts = ts(
+  east_ts_monthly$x,
+  frequency = 12,
+  start = c(2016, 01),
+  end = c(2017, 12)
+  )
+plot(east_myts)
+
+myds_monthly_east = decompose(east_myts)
+plot(myds_monthly_east)
+
+
+my_df_ts_east = data.frame(totalspend = east_myts, as.numeric(time(east_myts)))
+names(my_df_ts_east) = c("totalspend", "time")
+mymodel_east = tslm(totalspend ~ season+ trend, my_df_ts_east)
+my_fc_east = forecast(mymodel_east,h = 49)
+autoplot(my_fc_east, main = "East Region",ylab = "Total Spend")
+```
+```{r}
+# Updated version for east region
+d_east_a = d_east_sort
+d_east_a$PURCHASE_ = as.Date(d_east$PURCHASE_,format = '%d-%b-%y')
+d_east_a = d_east_a[order(d_east_a$PURCHASE_),]
+d_east_a$totalSPEND = as.numeric(d_east_a$totalSPEND)
+str(d_east_a)
+
+d_east_a = mutate(d_east_a, YearMonth = paste(year(PURCHASE_),formatC(month(PURCHASE_), width = 2, flag = "0")))
+
+east_tsa_monthly = aggregate(
+  d_east_a$totalSPEND,
+  by = list(d_east_a$YearMonth),
+  FUN = function(x)
+  mean(x, na.rm = T)
+  )
+
+east_mytsta = ts(
+  east_tsa_monthly$x,
+  frequency = 12,
+  start = c(2016, 01),
+  end = c(2017, 12)
+  )
+  plot(east_mytsta)
+
+mydsa_monthly_east = decompose(east_mytsta)
+plot(mydsa_monthly_east)
+
+
+my_df_tsa_east = data.frame(totalspend = east_mytsta, as.numeric(time(east_mytsta)))
+names(my_df_tsa_east) = c("totalspend", "time")
+mymodela_east = tslm(totalspend ~ season+ trend, my_df_tsa_west)
+my_fca_east = forecast(mymodela_east,h = 49)
+autoplot(my_fca_east, main = "East Region",ylab = "Total Spend")
+```
+
+```{r}
+# Time series(south region) 
+d_south_sort_ts = d_south[order(as.Date(d_south$PURCHASE_, format = "%d-%b-%y")),]
+d_south_sort_ts$totalSPEND = as.numeric(d_south_sort_ts$totalSPEND)
+
+south_ts_monthly = aggregate(
+  d_south_sort_ts$totalSPEND,
+  by = list(d_south_sort_ts$PURCHASE_),
+  FUN = function(x)
+  mean(x, na.rm = T)
+  )
+
+south_myts = ts(
+  south_ts_monthly$x,
+  frequency = 12,
+  start = c(2016, 01),
+  end = c(2017, 12)
+  )
+  plot(south_myts)
+
+myds_monthly_south = decompose(south_myts)
+plot(myds_monthly_south)
+
+
+my_df_ts_south = data.frame(totalspend = south_myts, as.numeric(time(south_myts)))
+names(my_df_ts_south) = c("totalspend", "time")
+mymodel_south = tslm(totalspend ~ season+ trend, my_df_ts_south)
+my_fc_south = forecast(mymodel_south,h = 49)
+autoplot(my_fc_south, main = "South Region", ylab = "Total Spend")
+```
+```{r}
+# Updated time series(south region) 
+d_south_a = d_south_sort
+d_south_a$PURCHASE_ = as.Date(d_east$PURCHASE_,format = '%d-%b-%y')
+d_south_a = d_south_a[order(d_south_a$PURCHASE_),]
+d_south_a$totalSPEND = as.numeric(d_south_a$totalSPEND)
+str(d_south_a)
+
+d_south_a = mutate(d_south_a, YearMonth = paste(year(PURCHASE_),formatC(month(PURCHASE_), width = 2, flag = "0")))
+
+south_tsa_monthly = aggregate(
+  d_south_a$totalSPEND,
+  by = list(d_south_a$YearMonth),
+  FUN = function(x)
+  mean(x, na.rm = T)
+  )
+
+south_mytsta = ts(
+  south_tsa_monthly$x,
+  frequency = 12,
+  start = c(2016, 01),
+  end = c(2017, 12)
+  )
+
+plot(south_mytsta)
+
+mydsa_monthly_south = decompose(south_mytsta)
+plot(mydsa_monthly_south)
+
+
+my_df_tsa_south <- data.frame(totalspend = south_mytsta, as.numeric(time(south_mytsta)))
+names(my_df_tsa_south) <- c("totalspend", "time")
+mymodela_south = tslm(totalspend ~ season+ trend, my_df_tsa_south)
+my_fca_south = forecast(mymodela_south,h = 49)
+autoplot(my_fca_south, main = "South Region",ylab = "Total Spend")
+```
+
+
+```{r}
+# Information related to week 12 
+wk_12 = summarise(group_by(data_merge1,COMMODITY,WEEK_NUM), totalspend = sum(SPEND))
+week_12 = filter(wk_12, WEEK_NUM == '12')
+pinduoduo = summarise(group_by(data_merge1,COMMODITY), totalsale = sum(SPEND))
+week_12_final = merge(week_12, pinduoduo, by = "COMMODITY")
+week_12_final$avg = week_12_final$totalsale / 104
+week_12_final$diff = (week_12_final$totalspend - week_12_final$avg) / week_12_final$avg
+```
+
+```{r}
+# Evaluating relationship between income level and comodities
+demo_data = merge(data_merge2,products, by = "PRODUCT_NUM")
+demo_product_income = summarise(group_by(demo_data,COMMODITY,INCOME_RANGE),totalSPEND = sum(SPEND))
+pp1 = summarise(group_by(demo_data,INCOME_RANGE), totalsale = sum(SPEND))
+demo_product_income = merge(demo_product_income, pp1, by = "INCOME_RANGE")
+demo_product_income = mutate(demo_product_income, percent = totalSPEND/totalsale*100)
+write.csv(demo_product_income,"demo_product_income")
+```
+
+
+```{r}
+# Evaluating relationship between marital status and commondities
+demo_product_marital = summarise(group_by(demo_data, COMMODITY, MARITAL), totalSPEND = sum(SPEND))
+pp2 = summarise(group_by(demo_data,MARITAL), totalsale = sum(SPEND))
+demo_product_marital = merge(demo_product_marital, pp2, by = "MARITAL")
+demo_product_marital = mutate(demo_product_marital, percent = totalSPEND/totalsale*100)
+write.csv(demo_product_marital,"demo_product_marital")
+```
+
+```{r}
+# Evaluating relationship between commodities and age
+demo_product_age = summarise(group_by(demo_data,COMMODITY,AGE_RANGE),totalSPEND = sum(SPEND))
+pp3 = summarise(group_by(demo_data,AGE_RANGE), totalsale = sum(SPEND))
+demo_product_age = merge(demo_product_age, pp3, by = "AGE_RANGE")
+demo_product_age = mutate(demo_product_age, percent = totalSPEND/totalsale*100)
+write.csv(demo_product_age,"demo_product_age")
+```
+
+```{r}
+# Evaluating relationship between home status and amount spent on each commodities
+demo_product_home = summarise(group_by(demo_data,COMMODITY,HOMEOWNER),totalSPEND = sum(SPEND))
+pp4 = summarise(group_by(demo_data,HOMEOWNER), totalsale = sum(SPEND))
+demo_product_home = merge(demo_product_home, pp4, by = "HOMEOWNER")
+demo_product_home = mutate(demo_product_home, percent = totalSPEND/totalsale*100)
+write.csv(demo_product_home,"demo_product_home")
+```
+
+```{r}
+# 1500 cutoff, spliting the data into two: total spend < 3500 and total spend >= 3500
+totalSpend_low = totalSpend[totalSpend$totalSPEND < 3500, ]
+totalSpend_low$HSHD_NUM=NULL
+
+
+spend_low = lm(totalSPEND~., data = totalSpend_low)
+mod_cd_low = cooks.distance(spend_low)
+totalSpend_low = totalSpend_low[mod_cd_low < 4 / length(mod_cd_low),]
+
+set.seed(8451)
+
+totalSpend_low_rf = train(
+  totalSPEND ~ .,
+  data = totalSpend_low,
+  trControl = trainControl(method = "cv", number = 5),
+  method = "rf",
+  tuneGrid = expand.grid(mtry = seq(1, ncol(totalSpend_low) - 1)))
+
+
+gbm_grid = expand.grid(interaction.depth = c(1, 2, 3),
+                       n.trees = (1:30) * 100,
+                       shrinkage = c(0.1, 0.3),
+                       n.minobsinnode = c(10, 20))
+
+set.seed(8451)
+totalSpend_low_gbm = train(
+  totalSPEND ~ .,
+  data = totalSpend_low,
+  trControl = trainControl(method = "cv", number = 5),
+  method = "gbm",
+  tuneGrid = gbm_grid,
+  verbose = FALSE
+)
+
+set.seed(8451)
+mod_elastic_low = train(
+  totalSPEND ~ .,
+  data = totalSpend_low,
+  trControl = trainControl(method = "cv", number = 5),
+  method = "glmnet",
+  tuneLength = 10
+)
+
+get_best_result(mod_elastic_low)$RMSE
+get_best_result(totalSpend_low_gbm)$RMSE
+get_best_result(totalSpend_low_rf)$RMSE
+```
+
+```{r}
+totalSpend_1500 = totalSpend[totalSpend$totalSPEND >= 3500, ]
+totalSpend_1500$HSHD_NUM = NULL
+
+spend_1500 = lm(totalSPEND ~ ., data = totalSpend_1500)
+mod_cd_1500 = cooks.distance(spend_1500)
+totalSpend_1500_fix = totalSpend_1500[mod_cd_1500 < 4 / length(mod_cd_1500), ]
+
+set.seed(8451)
+totalSpend_1500_rf = train(
+  totalSPEND ~ .,
+  data = totalSpend_1500_fix,
+  trControl = trainControl(method = "cv", number = 5),
+  method = "rf",
+  tuneGrid = expand.grid(mtry = seq(1, 2*ncol(totalSpend_1500_fix) - 1)))
+
+set.seed(8451)
+totalSpend_1500_gbm = train(
+  totalSPEND ~ .,
+  data = totalSpend_1500_fix,
+  trControl = trainControl(method = "cv", number = 5),
+  method = "gbm",
+  tuneGrid = gbm_grid,
+  verbose = FALSE
+)
+
+set.seed(8451)
+mod_elastic_1500 = train(
+  totalSPEND ~ .,
+  data = totalSpend_1500,
+  trControl = trainControl(method = "cv", number = 5),
+  method = "glmnet",
+  tuneLength = 10
+)
+
+get_best_result(mod_elastic_1500)$RMSE
+get_best_result(totalSpend_1500_gbm)$RMSE
+get_best_result(totalSpend_1500_rf)$RMSE
+totalSpend_1500_rf$results
+
+```
+
+## Exploratory data analysis
+
+
+
+
+
+
+
+***
+
+# Methods
+
+## Preprocessing of the data
+
+
+
+## Split the data
+
+
+## Model training
+
+
+
+***
+
+# Results
+
+
+
+## Best model selection
+
+
+
+***
+
+# Discussion
+
+
+
+***
+
+# Appendix
+
+## Full data dictionary
+
+
+## Data structure
+
+
